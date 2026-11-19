@@ -56,7 +56,7 @@ sys.path.insert(0, "/kaggle/working/unified")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 MODEL       = "{model}"
-FEATURE_SET = "full"      # set to "no_confirm" / "no_age" / "no_both" for the ablation
+FEATURE_SET = "no_confirm"  # headline (leakage-free); "full" / "no_age" / "no_both" for ablations
 EPOCHS      = {epochs}
 
 import argparse
@@ -64,7 +64,8 @@ from run import run_one
 
 args = argparse.Namespace(
     data_root="/kaggle/input", out_root="/kaggle/working/outputs",
-    epochs=EPOCHS, micro_batch=0, workers=2, no_xai=False, tune=0)
+    epochs=EPOCHS, micro_batch=0, workers=2, no_xai=False, tune=0,
+    limit=0, xai_eval_cases=None)
 
 result = run_one(MODEL, FEATURE_SET, args)
 """

@@ -9,7 +9,10 @@ number of forward passes per optimiser step changes.
 On CUDA OOM the micro-batch is halved and the model retried, so one greedy
 architecture cannot abort the sweep.
 
-    python run_all_local.py --epochs 8 --data-root ../../data --out-root ../../runs
+    python run_all_local.py                       # 14 models, headline feature set
+    python run_all_local.py --feature-sets full   # leaky comparison run
+
+Interrupted runs resume from their last completed epoch (last.pt).
 """
 from __future__ import annotations
 
@@ -22,24 +25,27 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import MODEL_ZOO
+from config import MODEL_ZOO, HEADLINE_FEATURE_SET
+
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Micro-batch that fits 4 GB with AMP. Effective batch is restored to 32 by
 # gradient accumulation inside engine.py.
 VRAM_4GB = {
-    "vit_early_fusion": 8,
-    "hybrid_vit_mlp": 8,
-    "biovil_lcsa": 8,
-    "segformer_laca": 4,
-    "swinv2_tabtransformer": 8,
-    "swinv2_gat": 8,
-    "convnext_bilinear": 16,
-    "maxvit_crossattn": 8,
-    "gnn_maxvit": 8,
-    "convnext_bicross": 16,
-    "davit_gated": 16,
-    "dinov2_crossattn": 16,
-    "effnetv2_crossattn": 16,
+    # measured on an RTX 3050 Laptop (4 GB) with bf16 + GPU augmentation
+    "vit_early_fusion": 16,
+    "hybrid_vit_mlp": 16,
+    "biovil_lcsa": 16,
+    "segformer_laca": 8,
+    "swinv2_tabtransformer": 16,
+    "swinv2_gat": 16,
+    "convnext_bilinear": 32,
+    "maxvit_crossattn": 16,
+    "gnn_maxvit": 16,
+    "convnext_bicross": 32,
+    "davit_gated": 32,
+    "dinov2_crossattn": 32,
+    "effnetv2_crossattn": 32,
     "unet_crossattn": 32,
 }
 
@@ -64,7 +70,7 @@ PRIORITY = [
 
 
 def run(model: str, feature_set: str, args, micro: int) -> int:
-    cmd = [sys.executable, "-u", "run.py",
+    cmd = [sys.executable, "-u", os.path.join(HERE, "run.py"),
            "--model", model, "--feature-set", feature_set,
            "--epochs", str(args.epochs), "--micro-batch", str(micro),
            "--workers", str(args.workers),
@@ -82,11 +88,11 @@ def run(model: str, feature_set: str, args, micro: int) -> int:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--epochs", type=int, default=8)
-    ap.add_argument("--workers", type=int, default=8)
-    ap.add_argument("--data-root", required=True)
-    ap.add_argument("--out-root", required=True)
-    ap.add_argument("--feature-sets", nargs="*", default=["full"])
+    ap.add_argument("--epochs", type=int, default=15)
+    ap.add_argument("--workers", type=int, default=0)
+    ap.add_argument("--data-root", default=os.path.normpath(os.path.join(HERE, "..", "..", "data")))
+    ap.add_argument("--out-root", default=os.path.join(HERE, "outputs"))
+    ap.add_argument("--feature-sets", nargs="*", default=[HEADLINE_FEATURE_SET])
     ap.add_argument("--models", nargs="*", default=PRIORITY)
     ap.add_argument("--no-xai", action="store_true")
     ap.add_argument("--skip-done", action="store_true", default=True)
@@ -122,6 +128,10 @@ def main() -> None:
             if "out of memory" in tail.lower() and micro > 1:
                 micro = max(1, micro // 2)
                 print(f"    OOM -> retrying with micro={micro}", flush=True)
+                continue
+            if attempt < 2:
+                # transient crash: the run resumes from last.pt
+                print(f"    rc={rc} -> resuming (attempt {attempt + 2}/3)", flush=True)
                 continue
             print(f"    FAILED rc={rc}", flush=True)
             break

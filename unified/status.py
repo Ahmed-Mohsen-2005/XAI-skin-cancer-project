@@ -1,7 +1,7 @@
 """
 One-glance status of the training sweep.
 
-    python status.py --runs ../../runs
+    python status.py --runs outputs
 
 Shows what has finished, what is training right now, the live epoch line, and
 an ETA extrapolated from the epoch times actually observed so far.
@@ -20,11 +20,12 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import MODEL_ZOO
 from run_all_local import PRIORITY
+from config import HEADLINE_FEATURE_SET
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--runs", default="../../runs")
+    ap.add_argument("--runs", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs"))
     a = ap.parse_args()
     root = a.runs
 
@@ -85,7 +86,7 @@ def main() -> None:
               "(sweep may be finished, between models, or stopped)")
 
     # eta
-    remaining = [m for m in PRIORITY if f"{m}__full" not in done]
+    remaining = [m for m in PRIORITY if f"{m}__{HEADLINE_FEATURE_SET}" not in done]
     if remaining and epoch_secs:
         # Use the most recent epochs rather than the all-time median: power
         # mode, thermal state and clock can change mid-sweep, and the recent

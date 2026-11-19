@@ -29,6 +29,22 @@ def choose_threshold(y_true: np.ndarray, y_prob: np.ndarray, rule: str = "youden
     if rule == "youden":
         fpr, tpr, thr = roc_curve(y_true, y_prob)
         return float(thr[int(np.argmax(tpr - fpr))])
+    if rule == "accuracy":
+        # exact accuracy-maximising cut over every distinct score on VALIDATION;
+        # ties are broken toward the middle of the tied range for stability.
+        p = np.asarray(y_prob, dtype=float).ravel()
+        y = np.asarray(y_true).astype(int).ravel()
+        order = np.argsort(-p)
+        ps, ys = p[order], y[order]
+        tp = np.cumsum(ys)                       # predicting positive for top-k
+        fp = np.cumsum(1 - ys)
+        tn = (len(y) - ys.sum()) - fp
+        acc = (tp + tn) / len(y)
+        best = np.flatnonzero(acc >= acc.max() - 1e-12)
+        k = int(best[len(best) // 2])
+        hi = ps[k]
+        lo = ps[k + 1] if k + 1 < len(ps) else hi - 1e-6
+        return float((hi + lo) / 2)
     if rule == "f1":
         grid = np.linspace(0.05, 0.95, 181)
         scores = [f1_score(y_true, (y_prob >= t).astype(int), average="macro") for t in grid]

@@ -56,7 +56,23 @@ FEATURE_SETS: Dict[str, Dict[str, Any]] = {
     "no_age":     {"drop_prefixes": AGE_PREFIXES},
     "no_both":    {"drop_prefixes": (CONFIRM_PREFIX,) + AGE_PREFIXES},
 }
-DEFAULT_FEATURE_SET = "full"       # main table; ablations are separate runs
+# The headline configuration is leakage-controlled. With the confirmation
+# field present every model scores 100% on the 647 test cases that were not
+# biopsied (they are all benign by construction) and SHAP ranks the field
+# first for every architecture, i.e. the explanation describes the shortcut.
+HEADLINE_FEATURE_SET = "no_confirm"
+DEFAULT_FEATURE_SET = HEADLINE_FEATURE_SET
+
+# Clinical variables, for grouped (one-hot aware) Shapley attribution.
+META_GROUPS = (
+    ("age", ("age_scaled", "age_group")),
+    ("sex", ("sex_",)),
+    ("anatomic site", ("anatom_site_general",)),
+    ("dermoscope type", ("dermoscopic_type",)),
+    ("melanocytic", ("melanocytic",)),
+    ("history of melanoma", ("history_of_mm",)),
+    ("confirmation method", (CONFIRM_PREFIX,)),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -79,41 +95,59 @@ class UnifiedConfig:
     effective_batch: int = 32  # held constant via gradient accumulation
     micro_batch: int = 32      # ONLY per-model knob (VRAM); see MODEL_ZOO
     epochs: int = 20
-    warmup_epochs: int = 2
+    warmup_epochs: int = 1
     lr_head: float = 3e-4
-    lr_backbone: float = 3e-5  # discriminative LR: 10x lower on pretrained weights
+    lr_backbone: float = 4e-5  # discriminative LR: lower on pretrained weights
     min_lr: float = 1e-6
     weight_decay: float = 0.05
     grad_clip: float = 1.0
     label_smooth: float = 0.05
     ema_decay: float = 0.999
-    early_stop_patience: int = 6
+    early_stop_patience: int = 5
     monitor: str = "val_auc"
+
+    # -- augmentation (GPU, IDENTICAL) --------------------------------------
+    # Dermoscopy has no canonical orientation, so full rotation + both flips.
+    aug_scale: List[float] = field(default_factory=lambda: [0.70, 1.0])
+    aug_rotate: float = 180.0
+    aug_color: float = 0.15
+    aug_erase_p: float = 0.25
+    # Counterfactual vignette augmentation. In the training split a black
+    # dermoscope vignette is present on ~25% of melanomas but ~8% of benign
+    # lesions, and the earlier Grad-CAMs lit up the ring instead of the lesion.
+    # Synthetic vignettes are added so that its rate is equal in both classes
+    # (plus `vignette_extra`), which removes the shortcut without discarding
+    # any image.
+    vignette_debias: bool = True
+    vignette_extra: float = 0.10
 
     # -- runtime -----------------------------------------------------------
     amp: bool = True
+    amp_dtype: str = "bf16"       # Ampere+: no loss scaling, no fp16 overflow
     channels_last: bool = True
-    num_workers: int = 4
+    num_workers: int = 4          # only used by the legacy CPU loader
     seed: int = SEED
     deterministic: bool = False   # cudnn.benchmark instead, for throughput
+    cache_dir: str = ""           # uint8 image memmaps; "" -> auto
 
     # -- evaluation protocol (IDENTICAL) -----------------------------------
-    threshold_rule: str = "youden"  # chosen on VALIDATION, applied to TEST
+    threshold_rule: str = "accuracy"  # chosen on VALIDATION, applied to TEST
     calibrate: bool = True          # temperature scaling fitted on VALIDATION
-    tta: bool = False               # off for the main table (fair comparison)
+    tta: bool = True                # 8-view dihedral TTA, applied to EVERY model
     n_bootstrap: int = 1000         # 95% CI on test metrics
 
     # -- XAI (IDENTICAL) ---------------------------------------------------
     xai_sample_strategy: str = "single"  # ONE representative case per figure
     xai_n_samples: int = 1
-    ig_steps: int = 50
-    lime_n_samples: int = 1000
-    # KernelExplainer evaluates (shap_nsamples x shap_background) forward passes
-    # with the image held fixed. These values keep that product near 4k, which
-    # is a few minutes even for SegFormer-B5; raising them improves the
-    # attribution estimate at roughly linear cost.
-    shap_background: int = 25
-    shap_nsamples: int = 150
+    ig_steps: int = 32            # x ig_noise SmoothGrad draws, blurred baseline
+    ig_noise: int = 4
+    xai_eval_cases: int = 24      # cases scored for faithfulness / localisation
+    # Grouped Shapley values are computed EXACTLY over the clinical variables
+    # (2^G coalitions, G <= 7) against `shap_background` training rows, with
+    # the image held fixed. One-hot columns of one variable form one player.
+    shap_background: int = 32
+    shap_nsamples: int = 0        # unused (kept for old results.json files)
+    perm_n: int = 512             # test rows for global permutation importance
 
     # -- paths -------------------------------------------------------------
     data_root: str = "/kaggle/input"
@@ -223,6 +257,7 @@ BASELINES = ["metadata_only_rf", "metadata_only_lr", "image_only_vit"]
 
 
 def get_config(model_name: str, **overrides) -> UnifiedConfig:
+    """Build the shared config; only fields that exist may be overridden."""
     if model_name not in MODEL_ZOO:
         raise KeyError(f"{model_name!r} not in MODEL_ZOO; choose from {list(MODEL_ZOO)}")
     cfg = UnifiedConfig(model_name=model_name,

@@ -1,7 +1,8 @@
 """
 Aggregates every finished run into the paper's tables and figures.
 
-    python report.py --out-root outputs --paper-dir ../paper/generated
+    python report.py                                  # outputs/ -> outputs/report/
+    python report.py --data-root ../../data           # also metadata-only baselines
 
 Produces
     results_all.csv                 every run, every metric
@@ -12,6 +13,9 @@ Produces
     fig_confusion_top3.png          confusion matrices, three best by AUC
     fig_auc_ranking.png             all models ranked, coloured by family
     baselines.json                  metadata-only and image-only reference points
+    ensemble.json / table_ensemble.tex   greedy ensemble selected on VALIDATION
+    xai_summary.csv / table_xai.tex / fig_xai_scores.png
+                                    explanation faithfulness + localisation per model
 """
 from __future__ import annotations
 
@@ -29,8 +33,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, confusion_matrix
 
-from config import MODEL_ZOO
-from metrics import delong_like_pvalue
+from config import MODEL_ZOO, HEADLINE_FEATURE_SET
+from metrics import (bootstrap_ci, choose_threshold, compute_metrics,
+                     delong_like_pvalue, TemperatureScaler)
 
 FAMILY_COLORS = {
     "Early fusion": "#1f77b4", "Late fusion": "#7f9fc4",
@@ -266,7 +271,9 @@ def table_ablation(df: pd.DataFrame, path: str, baselines: Dict | None = None) -
 
 
 def table_highlight(df: pd.DataFrame, path: str) -> None:
-    d = df[df["feature_set"] == "full"].sort_values("auc", ascending=False)
+    d = df[df["feature_set"] == HEADLINE_FEATURE_SET].sort_values("auc", ascending=False)
+    if d.empty:
+        d = df.drop_duplicates("model").sort_values("auc", ascending=False)
     lines = [
         r"\begin{table}[t]", r"\centering",
         r"\caption{Provenance of each configuration. \emph{Designed here} marks "
@@ -286,11 +293,169 @@ def table_highlight(df: pd.DataFrame, path: str) -> None:
         f.write("\n".join(lines) + "\n")
 
 
+
+# ---------------------------------------------------------------------------
+#  Ensemble (selected on VALIDATION only)
+# ---------------------------------------------------------------------------
+def _logits(p, split: str) -> np.ndarray:
+    k = f"{split}_logits"
+    if k in p:
+        return np.asarray(p[k], dtype=float)
+    q = np.clip(np.asarray(p[f"{split}_prob"], dtype=float), 1e-6, 1 - 1e-6)
+    return np.log(q / (1 - q))
+
+
+def greedy_ensemble(main_df: pd.DataFrame, max_k: int = 5) -> Dict:
+    """
+    Caruana-style forward selection: start from the best single model by
+    validation AUC and add the model that most improves the validation AUC of
+    the averaged, standardised logits. Temperature and threshold are then
+    fitted on validation and applied once to test.
+    """
+    from sklearn.metrics import roc_auc_score
+    from engine import sigmoid
+    pool = {}
+    for _, r in main_df.iterrows():
+        p = np.load(os.path.join(r["_dir"], "predictions.npz"))
+        vl, tl = _logits(p, "val"), _logits(p, "test")
+        mu, sd = vl.mean(), vl.std() + 1e-8
+        pool[r["model"]] = ((vl - mu) / sd, (tl - mu) / sd, p["val_y"], p["test_y"])
+    if len(pool) < 2:
+        return {}
+    vy = next(iter(pool.values()))[2]
+    ty = next(iter(pool.values()))[3]
+    chosen: List[str] = []
+    best_auc, hist = -1.0, []
+    while len(chosen) < max_k:
+        cand = None
+        for m in pool:
+            if m in chosen:
+                continue
+            v = np.mean([pool[c][0] for c in chosen + [m]], axis=0)
+            a = roc_auc_score(vy, v)
+            if cand is None or a > cand[1]:
+                cand = (m, a)
+        if cand is None or cand[1] <= best_auc + 1e-4:
+            break
+        chosen.append(cand[0])
+        best_auc = cand[1]
+        hist.append({"added": cand[0], "val_auc": float(cand[1])})
+    vl = np.mean([pool[c][0] for c in chosen], axis=0)
+    tl = np.mean([pool[c][1] for c in chosen], axis=0)
+    t = TemperatureScaler().fit(vl, vy)
+    vp, tp = sigmoid(vl / t), sigmoid(tl / t)
+    thr = choose_threshold(vy, vp, "accuracy")
+    return {"members": chosen, "selection": hist, "temperature": t, "threshold": thr,
+            "val": compute_metrics(vy, vp, thr), "test": compute_metrics(ty, tp, thr),
+            "test_ci95": bootstrap_ci(ty, tp, thr, 1000, 42)}
+
+
+def table_ensemble(ens: Dict, main_df: pd.DataFrame, path: str) -> None:
+    best = main_df.sort_values("auc", ascending=False).iloc[0]
+    t = ens["test"]
+    names = ", ".join(_esc(MODEL_ZOO.get(m, {}).get("display", m)) for m in ens["members"])
+    lines = [r"\begin{table}[t]", r"\centering",
+             r"\caption{Greedy ensemble selected on validation AUC only (members: "
+             + names + r"), against the best single model. Threshold and temperature "
+             r"fitted on validation.}", r"\label{tab:ensemble}",
+             r"\begin{tabular}{lccccc}", r"\toprule",
+             r"Model & Acc & Bal-Acc & F1 & AUC & PR-AUC \\", r"\midrule",
+             f"{_esc(best['display'])} & {best['accuracy']:.4f} & {best['balanced_accuracy']:.4f} & "
+             f"{best['f1']:.4f} & {best['auc']:.4f} & {best['pr_auc']:.4f} \\\\",
+             f"Ensemble ($k={len(ens['members'])}$) & {t['accuracy']:.4f} & "
+             f"{t['balanced_accuracy']:.4f} & {t['f1']:.4f} & {t['auc']:.4f} & {t['pr_auc']:.4f} \\\\",
+             r"\bottomrule", r"\end{tabular}", r"\end{table}"]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+# ---------------------------------------------------------------------------
+#  Explanation quality across models
+# ---------------------------------------------------------------------------
+XAI_METHODS = ("Grad-CAM", "Grad-CAM++", "Integrated Gradients", "Occlusion",
+               "Attention (grad-rollout)", "Clinical->image attention",
+               "LACA gate", "LCSA sparse attention", "_random")
+
+
+def xai_frame(runs: List[Dict]) -> pd.DataFrame:
+    rows = []
+    for r in runs:
+        ev = (r.get("xai") or {}).get("eval", {}).get("summary", {})
+        for m, s in ev.items():
+            rows.append({"model": r["model_name"], "display": r.get("display", r["model_name"]),
+                         "feature_set": r["feature_set"], "method": m,
+                         "deletion": s.get("deletion"), "insertion": s.get("insertion"),
+                         "energy_in_lesion": s.get("energy_in_lesion"),
+                         "lesion_focus_gain": s.get("lesion_focus_gain"),
+                         "energy_outside_fov": s.get("energy_outside_fov"),
+                         "n": s.get("n"), "n_with_lesion": s.get("n_with_lesion")})
+    return pd.DataFrame(rows)
+
+
+def table_xai(xd: pd.DataFrame, path: str) -> None:
+    """Per model: best method by insertion-minus-deletion, against the random map."""
+    def f(v):
+        return "--" if v is None or pd.isna(v) else f"{v:.3f}"
+
+    def p(v):
+        return "--" if v is None or pd.isna(v) else f"{100 * v:.0f}\\%"
+
+    lines = [r"\begin{table}[t]", r"\centering",
+             r"\caption{Explanation quality on scored test cases. Del/Ins: deletion "
+             r"(lower is better) and insertion (higher is better) AUC of P(predicted class) "
+             r"as the most-attributed pixels are removed / restored. Lesion: share of "
+             r"attribution inside the automatically segmented lesion. Random: a smoothed "
+             r"random map on the same cases (chance level).}", r"\label{tab:xai}",
+             r"\begin{tabular}{llccc|ccc}", r"\toprule",
+             r"Model & Best method & Del & Ins & Lesion & Del$_{rnd}$ & Ins$_{rnd}$ & Lesion$_{rnd}$ \\",
+             r"\midrule"]
+    for model, g in xd.groupby("display"):
+        rnd = g[g["method"] == "_random"]
+        real = g[g["method"] != "_random"].copy()
+        if real.empty or rnd.empty:
+            continue
+        real["score"] = real["insertion"] - real["deletion"]
+        b = real.sort_values("score", ascending=False).iloc[0]
+        rr = rnd.iloc[0]
+        lines.append(f"{_esc(model)} & {_esc(b['method'])} & {f(b['deletion'])} & "
+                     f"{f(b['insertion'])} & {p(b['energy_in_lesion'])} & {f(rr['deletion'])} & "
+                     f"{f(rr['insertion'])} & {p(rr['energy_in_lesion'])} \\\\")
+    lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
+    with open(path, "w", encoding="utf-8") as f_:
+        f_.write("\n".join(lines) + "\n")
+
+
+def fig_xai_scores(xd: pd.DataFrame, path: str) -> None:
+    methods = [m for m in XAI_METHODS if m in set(xd["method"])]
+    models = sorted(xd["display"].unique())
+    fig, axes = plt.subplots(1, 3, figsize=(16, 0.38 * len(models) + 2.2), sharey=True)
+    cols = plt.get_cmap("tab10")
+    for ax, key, title in zip(axes, ("deletion", "insertion", "energy_in_lesion"),
+                              ("deletion AUC (lower = more faithful)",
+                               "insertion AUC (higher = more faithful)",
+                               "attribution inside lesion (higher = better localised)")):
+        for j, m in enumerate(methods):
+            s = xd[xd["method"] == m].set_index("display")[key].dropna()
+            ys = [models.index(d) + (j - len(methods) / 2) * 0.08 for d in s.index]
+            ax.scatter(s.values, ys, s=22, color="k" if m == "_random" else cols(j),
+                       marker="x" if m == "_random" else "o",
+                       label="random map" if m == "_random" else m)
+        ax.set_title(title, fontsize=9)
+        ax.grid(axis="x", alpha=0.3)
+    axes[0].set_yticks(range(len(models)))
+    axes[0].set_yticklabels(models, fontsize=8)
+    axes[-1].legend(fontsize=7, loc="lower right")
+    fig.tight_layout()
+    fig.savefig(path, dpi=170, bbox_inches="tight")
+    plt.close(fig)
+
+
 # ---------------------------------------------------------------------------
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out-root", default="outputs")
-    ap.add_argument("--paper-dir", default="../paper/generated")
+    here = os.path.dirname(os.path.abspath(__file__))
+    ap.add_argument("--out-root", default=os.path.join(here, "outputs"))
+    ap.add_argument("--paper-dir", default=os.path.join(here, "outputs", "report"))
     ap.add_argument("--data-root", default=None,
                     help="if given, also fit the metadata-only baselines")
     a = ap.parse_args()
@@ -308,12 +473,31 @@ def main() -> None:
         baselines = compute_baselines(a.data_root)
         with open(os.path.join(a.paper_dir, "baselines.json"), "w", encoding="utf-8") as f:
             json.dump(baselines, f, indent=2)
-        k = "metadata_only_rf__full"
-        print(f"metadata-only RF (no image): AUC {baselines[k]['auc']:.4f}")
+        for fs in (HEADLINE_FEATURE_SET, "full"):
+            k = f"metadata_only_rf__{fs}"
+            print(f"metadata-only RF (no image) [{fs}]: AUC {baselines[k]['auc']:.4f}")
 
-    main_df = df[df["feature_set"] == "full"].copy()
+    main_df = df[df["feature_set"] == HEADLINE_FEATURE_SET].copy()
+    if main_df.empty:
+        main_df = df[df["feature_set"] == "full"].copy()
     if main_df.empty:
         main_df = df.copy()
+    print(f"main table: feature set {main_df['feature_set'].iloc[0]!r}, {len(main_df)} models")
+
+    ens = greedy_ensemble(main_df)
+    if ens:
+        with open(os.path.join(a.paper_dir, "ensemble.json"), "w", encoding="utf-8") as f:
+            json.dump(ens, f, indent=2)
+        table_ensemble(ens, main_df, os.path.join(a.paper_dir, "table_ensemble.tex"))
+        t = ens["test"]
+        print(f"ensemble {ens['members']}: test acc {t['accuracy']:.4f} "
+              f"AUC {t['auc']:.4f} F1 {t['f1']:.4f}")
+
+    xd = xai_frame([r for r in runs if r["feature_set"] == main_df["feature_set"].iloc[0]])
+    if not xd.empty:
+        xd.to_csv(os.path.join(a.paper_dir, "xai_summary.csv"), index=False)
+        table_xai(xd, os.path.join(a.paper_dir, "table_xai.tex"))
+        fig_xai_scores(xd, os.path.join(a.paper_dir, "fig_xai_scores.png"))
 
     table_main(main_df, os.path.join(a.paper_dir, "table_main.tex"))
     table_highlight(df, os.path.join(a.paper_dir, "table_highlight.tex"))

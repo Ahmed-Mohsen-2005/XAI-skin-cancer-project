@@ -2,7 +2,7 @@
 Single entry point for every experiment in the study.
 
     python run.py --model vit_early_fusion
-    python run.py --model segformer_laca --feature-set no_confirm
+    python run.py --model segformer_laca --feature-set full   # leaky, for comparison
     python run.py --all                       # sequential sweep
     python run.py --model davit_gated --tune 20   # Optuna search first
 
@@ -10,8 +10,9 @@ Writes, per run:
     outputs/<model>__<feature_set>/results.json     metrics + config + history
     outputs/<model>__<feature_set>/predictions.npz  test/val probabilities
     outputs/<model>__<feature_set>/best.pt          checkpoint
-    outputs/<model>__<feature_set>/xai_panel.png    single-case XAI figure
-    outputs/<model>__<feature_set>/shap_metadata.png
+    outputs/<model>__<feature_set>/xai_panel.png    single-case XAI figure (scored)
+    outputs/<model>__<feature_set>/xai_gallery.png  TP / TN / FP / FN explanations
+    outputs/<model>__<feature_set>/shap_metadata.png  grouped Shapley + global importance
 """
 from __future__ import annotations
 
@@ -27,9 +28,9 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import MODEL_ZOO, FEATURE_SETS, get_config
+from config import MODEL_ZOO, FEATURE_SETS, DEFAULT_FEATURE_SET, get_config
 from data import build_loaders
-from engine import seed_everything, train_one_model
+from engine import keep_awake, seed_everything, train_one_model
 from models import build_model, count_params
 import xai as X
 
@@ -40,6 +41,8 @@ def run_one(model_name: str, feature_set: str, args) -> dict:
     cfg = get_config(model_name, feature_set=feature_set,
                      data_root=args.data_root, out_root=args.out_root,
                      epochs=args.epochs, num_workers=args.workers)
+    if args.xai_eval_cases is not None:
+        cfg.xai_eval_cases = args.xai_eval_cases
     if args.micro_batch:
         cfg.micro_batch = args.micro_batch
 
@@ -53,7 +56,7 @@ def run_one(model_name: str, feature_set: str, args) -> dict:
     print("=" * 78)
 
     seed_everything(cfg.seed, cfg.deterministic)
-    train_loader, val_loader, test_loader, meta_cols = build_loaders(cfg)
+    train_loader, val_loader, test_loader, meta_cols = build_loaders(cfg, limit=args.limit)
     print(f"  split  train={len(train_loader.dataset)} val={len(val_loader.dataset)} "
           f"test={len(test_loader.dataset)} | metadata features={len(meta_cols)}")
 
@@ -71,34 +74,20 @@ def run_one(model_name: str, feature_set: str, args) -> dict:
     result["origin"] = MODEL_ZOO[model_name]["origin"]
     result["novel_on_dataset"] = MODEL_ZOO[model_name]["novel_on_dataset"]
 
-    # ---- single-case XAI -------------------------------------------------
+    # ---- explainability suite ----------------------------------------------
     if not args.no_xai:
         try:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             preds = np.load(os.path.join(out_dir, "predictions.npz"))
-            case = X.select_case(preds["test_prob"], preds["test_y"], want_class=1)
-            ds = test_loader.dataset
-            case_id = str(ds.df.iloc[case].get("isic_id", f"idx{case}"))
-            print(f"\n  XAI on a single case: {case_id} "
-                  f"(p={preds['test_prob'][case]:.3f})")
-
-            panel = X.render_xai_panel(model, cfg, ds, case, device, out_dir,
-                                       result["display"], case_id)
-            result["xai"] = {"case_index": int(case), "case_id": case_id, **
-                             {k: v for k, v in panel.items() if k != "panel"}}
-            print(f"    panel -> {panel['panel']}  ({', '.join(panel['methods'])})")
-
-            n_bg = max(20, min(cfg.shap_background, len(ds)))
-            bg = ds.meta[np.random.default_rng(cfg.seed)
-                         .choice(len(ds), n_bg, replace=False)]
-            img_fixed = ds[case][0][None].to(device)
-            sv = X.shap_metadata(model, bg, ds.meta[case], img_fixed, device,
-                                 cfg.shap_nsamples)
-            if sv is not None:
-                p = X.render_shap_bar(sv, meta_cols, out_dir, result["display"])
-                result["xai"]["shap_values"] = {c: float(v) for c, v in zip(meta_cols, sv)}
-                print(f"    shap  -> {p}")
+            print("\n  XAI suite")
+            result["xai"] = X.run_xai_suite(
+                model, cfg, test_loader.dataset, train_loader.dataset,
+                preds["test_prob"], result["threshold"], result["temperature"],
+                out_dir, result["display"], device)
+            result.pop("xai_error", None)
         except Exception as exc:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
             print(f"    [warn] XAI stage failed: {type(exc).__name__}: {exc}")
             result["xai_error"] = f"{type(exc).__name__}: {exc}"
 
@@ -111,7 +100,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=None, choices=list(MODEL_ZOO))
     ap.add_argument("--all", action="store_true", help="run every model in the zoo")
-    ap.add_argument("--feature-set", default="full", choices=list(FEATURE_SETS))
+    ap.add_argument("--feature-set", default=DEFAULT_FEATURE_SET, choices=list(FEATURE_SETS))
     ap.add_argument("--ablation", action="store_true",
                     help="also run no_confirm / no_age / no_both for the model")
     ap.add_argument("--epochs", type=int, default=20)
@@ -121,7 +110,11 @@ def main() -> None:
     ap.add_argument("--out-root", default="/kaggle/working/outputs")
     ap.add_argument("--tune", type=int, default=0, help="Optuna trials before the final run")
     ap.add_argument("--no-xai", action="store_true")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="smoke test: only this many training batches per epoch")
+    ap.add_argument("--xai-eval-cases", type=int, default=None)
     args = ap.parse_args()
+    keep_awake(True)
 
     if not args.model and not args.all:
         ap.error("pass --model NAME or --all")

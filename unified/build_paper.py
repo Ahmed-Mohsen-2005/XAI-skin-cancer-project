@@ -266,11 +266,14 @@ def main() -> None:
 
     gen_dir = a.generated or os.path.join(a.paper, "generated")
     runs = load_runs(a.runs)
-    full = by_feature(runs, "full")
+    # the main table is the leakage-controlled headline configuration; the
+    # leaky "full" runs are only used where the manuscript compares the two
+    from config import HEADLINE_FEATURE_SET
+    full = by_feature(runs, HEADLINE_FEATURE_SET) or by_feature(runs, "full")
     noconf = by_feature(runs, "no_confirm")
     print(f"loaded {len(runs)} runs ({len(full)} full, {len(noconf)} no_confirm)")
     if not full:
-        raise SystemExit("no completed 'full' runs yet; nothing to build")
+        raise SystemExit("no completed headline runs yet; nothing to build")
 
     baselines = None
     bpath = os.path.join(gen_dir, "baselines.json")
@@ -493,11 +496,17 @@ def build_xai_subsection(full, gen_dir) -> List[str]:
              "across models and no case is chosen post hoc for its appearance. "
              "The selected lesion identifier is printed in each figure. "
              r"Spatial attribution uses Grad-CAM~\cite{selvaraju2020} and "
-             r"Grad-CAM++~\cite{chattopadhay2018} together with Integrated "
-             r"Gradients~\cite{sundararajan2017}; the metadata branch is "
-             r"attributed with SHAP~\cite{lundberg2017}, and "
-             r"LIME~\cite{ribeiro2016} is used for superpixel-level "
-             "sanity checks on the image branch."]
+             r"Grad-CAM++~\cite{chattopadhay2018} read from the last transformer "
+             "block (ViTs) or the final backbone feature map (CNNs) and averaged "
+             "over the eight test-time views, Integrated "
+             r"Gradients~\cite{sundararajan2017} with a blurred baseline and "
+             "SmoothGrad noise, blur-filled occlusion, and gradient-weighted "
+             "attention rollout for transformer backbones. Every map explains the "
+             "predicted class and is scored by deletion/insertion faithfulness and "
+             "by the share of attribution inside an automatically segmented lesion, "
+             r"against a random-map baseline (Table~\ref{tab:xai}). The metadata "
+             r"branch is attributed with exact grouped Shapley values~\cite{lundberg2017} "
+             "(one player per clinical variable) and grouped permutation importance."]
     import shutil
     shown = 0
     for r in full:
@@ -515,8 +524,9 @@ def build_xai_subsection(full, gen_dir) -> List[str]:
                       f"  \\caption{{Single-case explanation for "
                       f"{esc(r['display'])}"
                       + (f" (lesion {esc(case)})" if case else "") +
-                      ": original image with Grad-CAM, Grad-CAM++ and "
-                      r"Integrated Gradients overlays.}",
+                      ": attribution of the predicted class by each method, with "
+                      "the automatic lesion outline (dashed) and per-map "
+                      "faithfulness / localisation scores.}",
                       f"  \\label{{fig:xai{shown}}}", r"\end{figure}"]
             shown += 1
     # SHAP summary across models
@@ -530,7 +540,7 @@ def build_xai_subsection(full, gen_dir) -> List[str]:
     if top_feats:
         ranked = sorted(top_feats.items(), key=lambda kv: -float(np.mean(kv[1])))[:5]
         names = ", ".join(f"\\texttt{{{esc(k)}}}" for k, _ in ranked)
-        parts += ["", "Aggregating the single-case SHAP attributions across "
+        parts += ["", "Aggregating the single-case grouped Shapley attributions across "
                   f"architectures, the features with the largest mean absolute "
                   f"contribution are {names}."]
     return parts

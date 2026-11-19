@@ -51,7 +51,7 @@ class TokenBackbone(nn.Module):
             self.kind = "unet"
             self.net = UNetStyleEncoder(d=256)
             self.out_dim = 256
-            self.hw = (4, 4)
+            self.hw = self.net.grid
             return
 
         if name.startswith("nvidia/"):
@@ -157,16 +157,26 @@ class ConvBNAct(nn.Module):
 
 
 class UNetStyleEncoder(nn.Module):
-    """Multi-scale encoder trained from scratch (no ImageNet initialisation)."""
+    """
+    Multi-scale encoder trained from scratch (no ImageNet initialisation).
+
+    Each scale has two conv layers and the deepest stage is at 1/32 (7x7 at
+    224). Every scale is pooled to the same 7x7 grid and fused, so the token
+    grid keeps enough spatial resolution for localisation; the original
+    single-conv stages pooled to 4x4 left Grad-CAM nothing to localise with.
+    """
+
+    grid = (7, 7)
 
     def __init__(self, d: int = 256):
         super().__init__()
-        self.stem = ConvBNAct(3, 32)
-        self.down1 = nn.Sequential(nn.MaxPool2d(2), ConvBNAct(32, 64))
-        self.down2 = nn.Sequential(nn.MaxPool2d(2), ConvBNAct(64, 128))
-        self.down3 = nn.Sequential(nn.MaxPool2d(2), ConvBNAct(128, 256))
-        self.down4 = nn.Sequential(nn.MaxPool2d(2), ConvBNAct(256, 512))
-        self.proj = nn.Conv2d(32 + 64 + 128 + 256 + 512, d, 1)
+        self.stem = nn.Sequential(ConvBNAct(3, 32), ConvBNAct(32, 32))
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), ConvBNAct(32, 64), ConvBNAct(64, 64))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), ConvBNAct(64, 128), ConvBNAct(128, 128))
+        self.down3 = nn.Sequential(nn.MaxPool2d(2), ConvBNAct(128, 256), ConvBNAct(256, 256))
+        self.down4 = nn.Sequential(nn.MaxPool2d(2), ConvBNAct(256, 384), ConvBNAct(384, 384))
+        self.down5 = nn.Sequential(nn.MaxPool2d(2), ConvBNAct(384, 512), ConvBNAct(512, 512))
+        self.proj = nn.Conv2d(64 + 128 + 256 + 384 + 512, d, 1)
         self.norm = nn.LayerNorm(d)
 
     def forward(self, x):
@@ -175,7 +185,8 @@ class UNetStyleEncoder(nn.Module):
         f3 = self.down2(f2)
         f4 = self.down3(f3)
         f5 = self.down4(f4)
-        feats = [F.adaptive_avg_pool2d(f, (4, 4)) for f in (f1, f2, f3, f4, f5)]
+        f6 = self.down5(f5)
+        feats = [F.adaptive_avg_pool2d(f, self.grid) for f in (f2, f3, f4, f5)] + [f6]
         feat = self.proj(torch.cat(feats, dim=1))
         return self.norm(feat.flatten(2).transpose(1, 2))
 
