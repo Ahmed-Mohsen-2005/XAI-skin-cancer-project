@@ -1,0 +1,8 @@
+# Model checkpoints / weights (too large for GitHub, >100 MB limit)
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.onnx
+*.safetensors
+**/checkpoints/
