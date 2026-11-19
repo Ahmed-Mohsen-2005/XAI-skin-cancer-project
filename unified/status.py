@@ -94,19 +94,37 @@ def main() -> None:
         # under the *current* power/clock state. A median over a window that
         # straddles a power-mode change stays pinned to the old, slower rate.
         med = min(epoch_secs[-3:]) if len(epoch_secs) >= 3 else min(epoch_secs)
-        # crude per-model cost weight, relative to a ViT-class model
-        weight = {"segformer_laca": 2.0, "swinv2_tabtransformer": 1.2,
-                  "swinv2_gat": 1.1, "biovil_lcsa": 1.0, "vit_early_fusion": 1.0,
-                  "hybrid_vit_mlp": 1.0, "gnn_maxvit": 0.9,
-                  "maxvit_crossattn": 0.9, "dinov2_crossattn": 0.8,
-                  "convnext_bicross": 0.7, "convnext_bilinear": 0.7,
-                  "davit_gated": 0.7, "effnetv2_crossattn": 0.7,
-                  "unet_crossattn": 0.6}
+        # Per-model cost relative to a ViT-B/16 run, calibrated against
+        # measured wall clock on this GPU. The first version of this table
+        # assumed parameter count predicted runtime; it does not. Windowed
+        # attention and depthwise convolution are far slower per image here
+        # than plain ViT attention despite having fewer parameters
+        # (DaViT-T, 29M, took 95 min against ViT-B/16's 46 min at 86M).
+        weight = {"segformer_laca": 3.0, "gnn_maxvit": 2.0,
+                  "maxvit_crossattn": 2.0, "davit_gated": 2.1,
+                  "swinv2_tabtransformer": 1.9, "swinv2_gat": 1.8,
+                  "effnetv2_crossattn": 1.6, "convnext_bicross": 1.6,
+                  "convnext_bilinear": 1.6, "vit_early_fusion": 1.0,
+                  "biovil_lcsa": 1.0, "dinov2_crossattn": 1.0,
+                  "hybrid_vit_mlp": 0.75, "unet_crossattn": 0.65}
         epochs = list(done.values())[0]["config"]["epochs"] if done else 8
-        secs = sum(med * epochs * weight.get(m, 1.0) + 480 for m in remaining)
+
+        # Prefer measured wall clock over epoch extrapolation: per-epoch cost
+        # varies several-fold across architectures, so projecting one model's
+        # epoch time across the whole queue is badly biased.
+        observed = [(r["model_name"], r.get("train_minutes", 0))
+                    for r in done.values() if r.get("train_minutes")]
+        if observed:
+            unit = sum(mi / weight.get(mn, 1.0) for mn, mi in observed) / len(observed)
+            secs = sum(unit * weight.get(m, 1.0) * 60 + 300 for m in remaining)
+            basis = (f"{unit:.0f} min per unit-cost model, measured over "
+                     f"{len(observed)} finished runs")
+        else:
+            secs = sum(med * epochs * weight.get(m, 1.0) + 480 for m in remaining)
+            basis = f"{med:.0f}s per epoch (extrapolated)"
         eta = datetime.now() + timedelta(seconds=secs)
         print(f"\n  REMAINING: {len(remaining)} model(s)")
-        print(f"    current epoch rate  : {med:.0f}s")
+        print(f"    basis               : {basis}")
         print(f"    estimated finish    : {eta:%Y-%m-%d %H:%M} "
               f"(~{secs/3600:.1f} h)")
         print(f"    queue: {', '.join(remaining)}")
