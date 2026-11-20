@@ -61,8 +61,17 @@ def seed_everything(seed: int, deterministic: bool = False) -> None:
     torch.backends.cudnn.allow_tf32 = True
 
 
+def native_bf16() -> bool:
+    """
+    True only on GPUs with hardware bf16 (compute capability >= 8.0, Ampere+).
+    torch.cuda.is_bf16_supported() also returns True on T4 / P100 / GTX 16xx
+    through slow emulation, which would make Kaggle runs crawl.
+    """
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
+
+
 def amp_dtype(cfg: UnifiedConfig, device) -> torch.dtype:
-    if device.type == "cuda" and cfg.amp_dtype == "bf16" and torch.cuda.is_bf16_supported():
+    if device.type == "cuda" and cfg.amp_dtype == "bf16" and native_bf16():
         return torch.bfloat16
     return torch.float16
 

@@ -637,7 +637,8 @@ def grouped_shapley(model, img: torch.Tensor, x: np.ndarray, background: np.ndar
                 rows[ci][:, groups[gi][1]] = x[groups[gi][1]]
     rows = torch.tensor(rows.reshape(-1, x.shape[0]), dtype=torch.float32, device=device)
     probs = []
-    dt = torch.bfloat16 if (device.type == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16
+    from engine import native_bf16
+    dt = torch.bfloat16 if (device.type == "cuda" and native_bf16()) else torch.float16
     for i in range(0, len(rows), chunk):
         r = rows[i:i + chunk]
         with torch.autocast("cuda", dtype=dt, enabled=amp and device.type == "cuda"):
@@ -669,7 +670,8 @@ def grouped_permutation_importance(model, ds, idx: np.ndarray,
     imgs = torch.stack([ds[int(i)][0] for i in idx])
     meta = torch.tensor(ds.meta[idx], dtype=torch.float32)
     y = ds.labels[idx]
-    dt = torch.bfloat16 if (device.type == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16
+    from engine import native_bf16
+    dt = torch.bfloat16 if (device.type == "cuda" and native_bf16()) else torch.float16
 
     def score(mt: torch.Tensor) -> float:
         out = []
