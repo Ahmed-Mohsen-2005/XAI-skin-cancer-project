@@ -106,6 +106,11 @@ def main() -> None:
 
     todo = [(m, fs) for fs in args.feature_sets for m in args.models]
     print(f"sweep: {len(todo)} runs, {args.epochs} epochs each", flush=True)
+    # what THIS machine was asked to run, so status.py does not report the
+    # whole 14-model zoo as remaining on a laptop that runs only its share
+    with open(os.path.join(args.out_root, "sweep_plan.json"), "w", encoding="utf-8") as f:
+        json.dump({"models": list(args.models), "feature_sets": list(args.feature_sets),
+                   "epochs": args.epochs}, f, indent=2)
 
     for i, (model, fs) in enumerate(todo, 1):
         key = f"{model}__{fs}"

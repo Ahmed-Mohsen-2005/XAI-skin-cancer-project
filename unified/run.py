@@ -45,8 +45,10 @@ def run_one(model_name: str, feature_set: str, args) -> dict:
         cfg.xai_eval_cases = args.xai_eval_cases
     if args.micro_batch:
         cfg.micro_batch = args.micro_batch
+    if args.seed is not None:
+        cfg.seed = args.seed
 
-    tag = f"{model_name}__{feature_set}"
+    tag = f"{model_name}__{feature_set}" + (f"__{args.tag}" if args.tag else "")
     out_dir = os.path.join(cfg.out_root, tag)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -113,6 +115,8 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=0,
                     help="smoke test: only this many training batches per epoch")
     ap.add_argument("--xai-eval-cases", type=int, default=None)
+    ap.add_argument("--seed", type=int, default=None, help="override the shared seed (multi-seed runs)")
+    ap.add_argument("--tag", default="", help="suffix for the output folder, e.g. s1 or patient")
     args = ap.parse_args()
     keep_awake(True)
 
@@ -157,6 +161,9 @@ def main() -> None:
     os.makedirs(args.out_root, exist_ok=True)
     with open(os.path.join(args.out_root, "sweep_summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
+    # a non-zero exit lets run_all_local.py tell a crash from a finished run
+    if any("error" in s for s in summary):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

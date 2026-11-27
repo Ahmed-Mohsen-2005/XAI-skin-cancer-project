@@ -87,13 +87,18 @@ def load_split(data_root: str, feature_set: str = "full"
     dfs = {split: pd.read_csv(os.path.join(d, f"{split}.csv")) for split, d in dirs.items()}
     tr, va, te = dfs["train"], dfs["val"], dfs["test"]
 
+    custom = os.path.exists(os.path.join(data_root, "CUSTOM_SPLIT"))   # e.g. patient-grouped split
     for name, df, n in (("train", tr, N_TRAIN), ("val", va, N_VAL), ("test", te, N_TEST)):
-        if len(df) != n:
+        if len(df) != n and not custom:
             raise ValueError(
                 f"{name} split has {len(df)} rows but the frozen split defines {n}. "
                 "Refusing to run: the benchmark requires the identical partition.")
 
     meta_cols = build_feature_list(tr, feature_set)
+    if not meta_cols:   # image_only: one constant-zero column so every fusion head still builds
+        for df in (tr, va, te):
+            df["__zero__"] = 0.0
+        meta_cols = ["__zero__"]
     return tr, va, te, meta_cols, dirs
 
 
@@ -136,7 +141,20 @@ def build_cache(img_dir: str, files: List[str], cache_dir: str, split: str,
         return np.load(arr_p, mmap_mode="r"), np.load(vig_p)
 
     print(f"  caching {split}: {len(files)} images -> {arr_p}", flush=True)
-    tmp = arr_p + ".tmp"
+    # Leftovers from an interrupted build are removed when possible. On Windows
+    # a file still memory-mapped by a stuck process can be neither deleted nor
+    # truncated (EINVAL), so each build writes to its own per-process name.
+    import time as _time
+    for old in os.listdir(cache_dir):
+        p = os.path.join(cache_dir, old)
+        # only leftovers untouched for 30+ min: a live build rewrites its file
+        if (old.startswith(os.path.basename(arr_p)) and old.endswith(".tmp")
+                and _time.time() - os.path.getmtime(p) > 1800):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    tmp = f"{arr_p}.{os.getpid()}.tmp"
     arr = np.lib.format.open_memmap(tmp, mode="w+", dtype=np.uint8,
                                     shape=(len(files), size, size, 3))
     vig = np.zeros(len(files), dtype=bool)
@@ -150,7 +168,16 @@ def build_cache(img_dir: str, files: List[str], cache_dir: str, split: str,
         vig[i] = vignette_flag(a)
     arr.flush()
     del arr
-    os.replace(tmp, arr_p)
+    try:
+        os.replace(tmp, arr_p)
+    except OSError:
+        # another process finished the same cache first and has it mapped
+        if not os.path.exists(arr_p):
+            raise
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
     np.save(vig_p, vig)
     return np.load(arr_p, mmap_mode="r"), vig
 

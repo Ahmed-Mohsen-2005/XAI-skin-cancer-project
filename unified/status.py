@@ -86,7 +86,14 @@ def main() -> None:
               "(sweep may be finished, between models, or stopped)")
 
     # eta
-    remaining = [m for m in PRIORITY if f"{m}__{HEADLINE_FEATURE_SET}" not in done]
+    # only the models this machine was launched with (written by
+    # run_all_local.py); the full zoo only when no plan file exists
+    planned = PRIORITY
+    plan_p = os.path.join(root, "sweep_plan.json")
+    if os.path.exists(plan_p):
+        with open(plan_p, encoding="utf-8") as f:
+            planned = json.load(f).get("models") or PRIORITY
+    remaining = [m for m in planned if f"{m}__{HEADLINE_FEATURE_SET}" not in done]
     if remaining and epoch_secs:
         # Use the most recent epochs rather than the all-time median: power
         # mode, thermal state and clock can change mid-sweep, and the recent

@@ -55,6 +55,9 @@ FEATURE_SETS: Dict[str, Dict[str, Any]] = {
     "no_confirm": {"drop_prefixes": (CONFIRM_PREFIX,)},
     "no_age":     {"drop_prefixes": AGE_PREFIXES},
     "no_both":    {"drop_prefixes": (CONFIRM_PREFIX,) + AGE_PREFIXES},
+    # revision ablations
+    "no_melanocytic": {"drop_prefixes": (CONFIRM_PREFIX, "melanocytic")},
+    "image_only": {"drop_prefixes": ("",)},   # every metadata column dropped -> constant zero input
 }
 # The headline configuration is leakage-controlled. With the confirmation
 # field present every model scores 100% on the 647 test cases that were not
